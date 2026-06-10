@@ -185,8 +185,15 @@ func NewController(cache cache[[]byte], getter getter, persister persister, reg 
 		c.persister = persister
 	}
 
-	c.refreshG.SetLimit(30)
-	c.workG.SetLimit(25) // Sure why not.
+	// patched: cap in-flight author/work refreshes to bound peak memory.
+	// Upstream's 30/25 let the daily Readarr library-refresh burst hold ~30
+	// authors + 25 works live at once, overshooting the pod's cgroup limit
+	// and OOMKilling it (exit 137). Throughput is gated by the 1 req/sec
+	// Hardcover limiter (see throttledTransport below), not worker count, so
+	// a handful of workers keeps the limiter saturated at ~the same
+	// wall-clock while cutting the in-flight working set several-fold.
+	c.refreshG.SetLimit(6)
+	c.workG.SetLimit(6)
 
 	return c, nil
 }
