@@ -24,6 +24,25 @@ import (
 	"golang.org/x/exp/rand"
 )
 
+// HardcoverMaxBatchSize is the largest number of top-level fields we may put
+// into a single Hardcover GraphQL request.
+//
+// Hardcover enforces a per-request "burst capacity" counted in TOP-LEVEL
+// FIELDS, which is distinct from the per-minute request rate limit. Exceeding
+// it returns HTTP 403 with:
+//
+//	{"errors":["request_exceeds_capacity"],
+//	 "message":"This request has 15 top-level fields, which exceeds your
+//	            tier's burst capacity of 5. Split it into smaller requests."}
+//
+// The whole batch fails, so every query riding in it fails, and callers see the
+// upstream lookup return empty or 5xx. Upstream shipped 25 here with the
+// comment "Not sure about this"; on a free-tier key the correct value is 5.
+//
+// This is NOT the same limit as the 60/min request rate, which is handled
+// separately by the rate-limited transport.
+const HardcoverMaxBatchSize = 5
+
 // batchedgqlclient accumulates queries and executes them in batch in order to
 // make better use of RPS limits.
 type batchedgqlclient struct {

@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,9 @@ import (
 
 	"github.com/blampe/rreading-glasses/gr"
 	"github.com/blampe/rreading-glasses/hardcover"
+	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/language/parser"
+	"github.com/graphql-go/graphql/language/source"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vektah/gqlparser/v2/gqlerror"
@@ -403,4 +407,89 @@ func TestGQLStatusCode(t *testing.T) {
 	err = &gqlerror.Error{Message: "Request failed with status code 403"}
 	err403 := statusErr(403)
 	assert.ErrorAs(t, gqlStatusErr(err), &err403)
+}
+
+// TestHardcoverBatchNeverExceedsBurstCapacity asserts the invariant Hardcover
+// actually enforces: no request we send may contain more than
+// HardcoverMaxBatchSize TOP-LEVEL FIELDS.
+//
+// Hardcover counts top-level fields per request, separately from the 60/min
+// rate limit, and answers HTTP 403 "request_exceeds_capacity" when a request
+// exceeds the tier's burst capacity. The whole batch fails, so every query
+// riding in it fails. Observed in production 2026-09-17 at 64 rejections/hour
+// with batches of 15, 9 and 6, which surfaced as /search returning HTTP 500.
+//
+// This parses the real outgoing request rather than inspecting internal state,
+// so it also guards against a future change to how batches are assembled - not
+// just against someone raising the constant back to upstream's 25.
+func TestHardcoverBatchNeverExceedsBurstCapacity(t *testing.T) {
+	// The limit as Hardcover states it, written out independently of
+	// HardcoverMaxBatchSize ON PURPOSE. Asserting against the constant the
+	// client was built from is self-referential and passes for ANY value -
+	// including upstream's 25, which is the bug this test exists to catch.
+	const hardcoverFreeTierBurstCapacity = 5
+
+	// Tripwire: raising the constant past what the API accepts must fail here
+	// rather than in production as a 403 storm.
+	require.LessOrEqual(t, HardcoverMaxBatchSize, hardcoverFreeTierBurstCapacity,
+		"HardcoverMaxBatchSize exceeds the free tier's documented burst capacity")
+
+	var mu sync.Mutex
+	var topLevelCounts []int
+
+	client := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			var body struct {
+				Query string `json:"query"`
+			}
+			raw, _ := io.ReadAll(r.Body)
+			require.NoError(t, json.Unmarshal(raw, &body))
+
+			doc, err := parser.Parse(parser.ParseParams{
+				Source: source.NewSource(&source.Source{Body: []byte(body.Query)}),
+			})
+			require.NoError(t, err, "outgoing query must be valid GraphQL")
+
+			for _, def := range doc.Definitions {
+				op, ok := def.(*ast.OperationDefinition)
+				if !ok || op.GetSelectionSet() == nil {
+					continue
+				}
+				mu.Lock()
+				topLevelCounts = append(topLevelCounts, len(op.GetSelectionSet().Selections))
+				mu.Unlock()
+			}
+
+			return &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(strings.NewReader(`{"data": {}, "errors": []}`)),
+			}, nil
+		}),
+	}
+
+	gql, err := NewBatchedGraphQLClient("https://foo.com", client, 20*time.Millisecond, HardcoverMaxBatchSize, nil)
+	require.NoError(t, err)
+
+	// Comfortably more concurrent queries than one batch may carry.
+	const queries = 4 * hardcoverFreeTierBurstCapacity
+
+	wg := sync.WaitGroup{}
+	wg.Add(queries)
+	for i := range queries {
+		go func(i int) {
+			defer wg.Done()
+			_, _ = gr.GetBook(t.Context(), gql, int64(i))
+		}(i)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.NotEmpty(t, topLevelCounts, "expected at least one outgoing request")
+	for _, n := range topLevelCounts {
+		assert.LessOrEqual(t, n, hardcoverFreeTierBurstCapacity,
+			"a request carried %d top-level fields; Hardcover rejects anything over %d with request_exceeds_capacity",
+			n, hardcoverFreeTierBurstCapacity)
+	}
 }
