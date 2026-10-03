@@ -39,9 +39,23 @@ import (
 // upstream lookup return empty or 5xx. Upstream shipped 25 here with the
 // comment "Not sure about this"; on a free-tier key the correct value is 5.
 //
-// This is NOT the same limit as the 60/min request rate, which is handled
-// separately by the rate-limited transport.
+// This is NOT the same limit as the per-minute request rate, which is paced
+// by HardcoverBatchInterval.
 const HardcoverMaxBatchSize = 5
+
+// HardcoverBatchInterval is how often one batch is sent to Hardcover. It is
+// the ONLY thing pacing Hardcover traffic: the batch loop sends one request per
+// tick, and nothing else throttles the rghc client. (throttledTransport in
+// NewUpstream is used by the Goodreads binary only.)
+//
+// Upstream ships time.Second, i.e. ~60 requests/min -- exactly Hardcover's
+// documented limit, with no margin. Measured on a free-tier key during a
+// 2244-author Readarr refresh (2026-10-03): ~59 batches/min sent, ~27/min
+// rejected with 429, so only ~32/min got through. The rejected half buys
+// nothing: those lookups fail, Readarr logs "Couldn't refresh info", and the
+// author is retried tomorrow. Pacing at ~30/min sends what Hardcover actually
+// accepts, so useful throughput stays the same and the 429s stop.
+const HardcoverBatchInterval = 2 * time.Second
 
 // batchedgqlclient accumulates queries and executes them in batch in order to
 // make better use of RPS limits.
