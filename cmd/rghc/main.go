@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/blampe/rreading-glasses/cmd"
@@ -68,7 +67,7 @@ func (s *server) Run() error {
 
 	hcClient := &http.Client{Transport: hcTransport}
 
-	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, internal.HardcoverMaxBatchSize, reg)
+	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, internal.HardcoverBatchInterval, internal.HardcoverMaxBatchSize, reg)
 	if err != nil {
 		return err
 	}

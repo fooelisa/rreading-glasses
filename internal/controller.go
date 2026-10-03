@@ -141,7 +141,7 @@ type getter interface {
 func NewUpstream(host string, proxy string) (*http.Client, error) {
 	upstream := &http.Client{
 		Transport: throttledTransport{
-			ticker: time.NewTicker(time.Second), // patched: honor Hardcover 60/min limit (60 req/min = 1/sec)
+			ticker: time.NewTicker(time.Second), // Goodreads (rggr) only -- does NOT pace Hardcover; see HardcoverBatchInterval
 			RoundTripper: ScopedTransport{
 				Host:         host,
 				RoundTripper: errorProxyTransport{http.DefaultTransport},
