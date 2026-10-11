@@ -55,7 +55,13 @@ const HardcoverMaxBatchSize = 5
 // nothing: those lookups fail, Readarr logs "Couldn't refresh info", and the
 // author is retried tomorrow. Pacing at ~30/min sends what Hardcover actually
 // accepts, so useful throughput stays the same and the 429s stop.
-const HardcoverBatchInterval = 2 * time.Second
+//
+// 2 s (30/min) did NOT stop them. Over 2026-10-09..11 every daily refresh still
+// drew 244-308 429s, peaking at 16-18 rejects/min -- so only ~13/min got
+// through, fewer than at 60/min. That suggests Hardcover counts rejected
+// requests against the window, which makes over-sending actively harmful.
+// 3 s = 20/min; if 429s persist, go to 4 s.
+const HardcoverBatchInterval = 3 * time.Second
 
 // batchedgqlclient accumulates queries and executes them in batch in order to
 // make better use of RPS limits.
