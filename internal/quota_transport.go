@@ -11,8 +11,15 @@ import (
 	"time"
 )
 
-// QuotaTransport stops sending requests to Hardcover while one of its rate
-// limit buckets is empty.
+// quotaMinReset is the shortest bucket reset QuotaTransport acts on. Hardcover's
+// per-minute bucket resets within 60 s and is already respected by
+// HardcoverBatchInterval; blocking on it would only reject batches Hardcover
+// would have accepted once the bucket refilled. Only the daily bucket, which
+// resets at midnight UTC, is worth stopping for.
+const quotaMinReset = time.Minute
+
+// QuotaTransport stops sending requests to Hardcover once its daily quota is
+// used up.
 //
 // Hardcover answers every request with a RateLimit header (IETF draft format):
 //
@@ -21,11 +28,16 @@ import (
 // r is the requests left in a bucket and t the seconds until it refills. Every
 // top-level GraphQL field counts as one request, and the free tier allows 5,000
 // a day. Once the daily bucket is empty, every request returns 429 until
-// midnight UTC, so sending more only produces more 429s. While a bucket is
-// empty this transport answers locally with a 429, which callers already
-// handle, and no request reaches Hardcover.
+// midnight UTC, so sending more only produces more 429s. While blocked, this
+// transport answers locally with a 429, the same status a real rejection
+// gets, and no request reaches Hardcover.
 type QuotaTransport struct {
 	http.RoundTripper
+
+	// Reserve is how many requests a single call may spend. A bucket with
+	// fewer than Reserve left counts as empty, because a batch of that many
+	// fields would be rejected as a whole. Zero means 1.
+	Reserve int
 
 	now func() time.Time // now is replaceable for tests.
 
@@ -35,7 +47,11 @@ type QuotaTransport struct {
 
 // RoundTrip implements http.RoundTripper.
 func (t *QuotaTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if wait := t.wait(); wait > 0 {
+	start := t.clock()
+	if wait := t.wait(start); wait > 0 {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
 		return quotaExhaustedResponse(r, wait), nil
 	}
 
@@ -43,36 +59,34 @@ func (t *QuotaTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	t.observe(r.Context(), resp.Header.Get("RateLimit"))
+	// Hardcover computes t when it answers, so time the block from when the
+	// request went out rather than from when the response came back.
+	t.observe(r.Context(), start, resp.Header.Get("RateLimit"))
 	return resp, nil
 }
 
-// wait returns how long requests are still blocked, or 0.
-func (t *QuotaTransport) wait() time.Duration {
+// wait returns how long requests are still blocked at now, or 0.
+func (t *QuotaTransport) wait(now time.Time) time.Duration {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.blockedUntil.Sub(t.clock())
+	return t.blockedUntil.Sub(now)
 }
 
-// observe blocks requests until the latest reset of any empty bucket.
-func (t *QuotaTransport) observe(ctx context.Context, header string) {
-	wait := parseRateLimitWait(header)
+// observe blocks requests until the latest reset of any exhausted bucket.
+func (t *QuotaTransport) observe(ctx context.Context, start time.Time, header string) {
+	wait := parseRateLimitWait(header, max(t.Reserve, 1))
 	if wait <= 0 {
 		return
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	until := t.clock().Add(wait)
+	until := start.Add(wait)
 	if !until.After(t.blockedUntil) {
 		return
 	}
 	t.blockedUntil = until
-	// The per-minute bucket empties for a second or two at a time; only an
-	// empty daily bucket is worth a log line.
-	if wait > time.Minute {
-		Log(ctx).Warn("hardcover quota exhausted, pausing requests", "until", until.UTC().Format(time.RFC3339), "rateLimit", header)
-	}
+	Log(ctx).Warn("hardcover quota exhausted, pausing requests", "until", until.UTC().Format(time.RFC3339), "rateLimit", header)
 }
 
 func (t *QuotaTransport) clock() time.Time {
@@ -83,9 +97,10 @@ func (t *QuotaTransport) clock() time.Time {
 }
 
 // parseRateLimitWait reads a RateLimit header and returns how long to wait
-// before the next request: the longest reset time of any empty bucket, or 0
-// when every bucket has requests left. Entries it cannot parse are ignored.
-func parseRateLimitWait(header string) time.Duration {
+// before the next request: the longest reset of any bucket that has fewer
+// than need requests left and resets in more than quotaMinReset, or 0.
+// Entries it cannot parse are ignored.
+func parseRateLimitWait(header string, need int) time.Duration {
 	var wait time.Duration
 	for entry := range strings.SplitSeq(header, ",") {
 		remaining, reset := -1, -1
@@ -105,8 +120,9 @@ func parseRateLimitWait(header string) time.Duration {
 				reset = n
 			}
 		}
-		if remaining == 0 && reset > 0 {
-			wait = max(wait, time.Duration(reset)*time.Second)
+		resetIn := time.Duration(reset) * time.Second
+		if remaining >= 0 && remaining < need && resetIn > quotaMinReset {
+			wait = max(wait, resetIn)
 		}
 	}
 	return wait
