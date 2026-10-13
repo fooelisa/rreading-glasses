@@ -27,16 +27,17 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Use lower values while we're beta testing.
+// Upstream uses 7 d / 14 d / 28 d while in beta. This fork uses the longer
+// values upstream left commented out: Readarr refreshes every author daily,
+// and with ~2,200 authors the shorter TTLs need more Hardcover requests than
+// the free tier's 5,000-a-day quota allows. The cost is that a new book by a
+// known author can take up to a month (plus fuzz) to appear.
 var (
-	_authorTTL = 7 * 24 * time.Hour // 7 days.
-	// _authorTTL  = 30 * 24 * time.Hour     // 1 month.
+	_authorTTL = 30 * 24 * time.Hour // 1 month.
 
-	_workTTL = 14 * 24 * time.Hour // 2 weeks.
-	// _workTTL    = 30 * 24 * time.Hour     // 1 month.
+	_workTTL = 30 * 24 * time.Hour // 1 month.
 
-	_editionTTL = 28 * 24 * time.Hour // 1 month.
-	// _editionTTL = 6 * 30 * 24 * time.Hour // 6 months.
+	_editionTTL = 6 * 30 * 24 * time.Hour // 6 months.
 
 	_seriesTTL = 14 * 24 * time.Hour // 2 weeks
 
