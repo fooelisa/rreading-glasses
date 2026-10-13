@@ -60,8 +60,13 @@ const HardcoverMaxBatchSize = 5
 // drew 244-308 429s, peaking at 16-18 rejects/min -- so only ~13/min got
 // through, fewer than at 60/min. That suggests Hardcover counts rejected
 // requests against the window, which makes over-sending actively harmful.
-// 3 s = 20/min; if 429s persist, go to 4 s.
-const HardcoverBatchInterval = 3 * time.Second
+//
+// 3 s (20/min) did NOT stop them either. The 2026-10-12 refresh drew 373 429s
+// over 51 minutes (~7.3 rejects/min of 20 sent), so ~12.7/min got through --
+// the same ~13/min as at 2 s. Accepted throughput is flat whatever we send, so
+// this key's real ceiling is ~13/min, not the documented 60. 4 s (15/min)
+// would still exceed it; 5 s = 12/min is the first interval under it.
+const HardcoverBatchInterval = 5 * time.Second
 
 // batchedgqlclient accumulates queries and executes them in batch in order to
 // make better use of RPS limits.
