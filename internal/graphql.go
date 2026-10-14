@@ -63,9 +63,14 @@ const HardcoverMaxBatchSize = 5
 //
 // 3 s (20/min) did NOT stop them either. The 2026-10-12 refresh drew 373 429s
 // over 51 minutes (~7.3 rejects/min of 20 sent), so ~12.7/min got through --
-// the same ~13/min as at 2 s. Accepted throughput is flat whatever we send, so
-// this key's real ceiling is ~13/min, not the documented 60. 4 s (15/min)
-// would still exceed it; 5 s = 12/min is the first interval under it.
+// the same ~13/min as at 2 s.
+//
+// The cause, from Hardcover's docs and RateLimit headers (2026-10-13): every
+// TOP-LEVEL FIELD counts as one request. The per-minute limit is 60 fields, so
+// with HardcoverMaxBatchSize fields per batch, 60/5 = 12 batches/min is the
+// ceiling, and 5 s matches it exactly. The 429s left at 5 s come from the
+// separate DAILY limit (5,000 fields on the free tier), which a full Readarr
+// refresh exceeds; QuotaTransport stops sending once that bucket is empty.
 const HardcoverBatchInterval = 5 * time.Second
 
 // batchedgqlclient accumulates queries and executes them in batch in order to
