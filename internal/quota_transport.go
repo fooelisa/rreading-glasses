@@ -63,25 +63,41 @@ type QuotaTransport struct {
 	mu           sync.Mutex
 	blockedUntil time.Time
 	notBefore    time.Time
+	turn         chan struct{} // turn lets one request at a time pace and send.
 }
 
 // RoundTrip implements http.RoundTripper.
+//
+// Requests take turns: each one waits for the per-minute bucket and is sent
+// only after the previous one has been answered, so its wait is based on the
+// latest RateLimit header. Without this, requests that waited together would
+// all be sent at the same moment and all but the first would get a 429. The
+// batch loop sends one request at a time anyway, so this costs it nothing.
 func (t *QuotaTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	start := t.clock()
-	if wait := t.wait(start); wait > 0 {
-		if r.Body != nil {
-			_ = r.Body.Close()
-		}
-		return quotaExhaustedResponse(r, wait), nil
+	if err := t.takeTurn(r.Context()); err != nil {
+		closeBody(r)
+		return nil, err
 	}
-	if pace := t.pace(start); pace > 0 {
+	defer t.endTurn()
+
+	var start time.Time
+	for {
+		start = t.clock()
+		// Check the daily block again after every wait: another request's
+		// answer may have set it while this one waited.
+		if wait := t.wait(start); wait > 0 {
+			closeBody(r)
+			return quotaExhaustedResponse(r, wait), nil
+		}
+		pace := t.pace(start)
+		if pace <= 0 {
+			break
+		}
+		Log(r.Context()).Debug("waiting for hardcover per-minute bucket", "wait", pace.String())
 		if err := t.doSleep(r.Context(), pace); err != nil {
-			if r.Body != nil {
-				_ = r.Body.Close()
-			}
+			closeBody(r)
 			return nil, err
 		}
-		start = t.clock()
 	}
 
 	resp, err := t.RoundTripper.RoundTrip(r)
@@ -95,6 +111,36 @@ func (t *QuotaTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// the answer arrived: that is the latest moment its r can describe.
 	t.observePace(t.clock(), resp.Header.Get("RateLimit"), resp.Header.Get("RateLimit-Policy"))
 	return resp, nil
+}
+
+// takeTurn blocks until no other request is pacing or in flight.
+func (t *QuotaTransport) takeTurn(ctx context.Context) error {
+	t.mu.Lock()
+	if t.turn == nil {
+		t.turn = make(chan struct{}, 1)
+	}
+	turn := t.turn
+	t.mu.Unlock()
+
+	select {
+	case turn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t *QuotaTransport) endTurn() {
+	t.mu.Lock()
+	turn := t.turn
+	t.mu.Unlock()
+	<-turn
+}
+
+func closeBody(r *http.Request) {
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
 }
 
 // pace returns how long the next request must wait for the per-minute
@@ -172,25 +218,11 @@ func (t *QuotaTransport) clock() time.Time {
 func parseRateLimitWait(header string, need int) time.Duration {
 	var wait time.Duration
 	for entry := range strings.SplitSeq(header, ",") {
-		remaining, reset := -1, -1
-		for param := range strings.SplitSeq(entry, ";") {
-			key, val, ok := strings.Cut(strings.TrimSpace(param), "=")
-			if !ok {
-				continue
-			}
-			n, err := strconv.Atoi(val)
-			if err != nil {
-				continue
-			}
-			switch key {
-			case "r":
-				remaining = n
-			case "t":
-				reset = n
-			}
-		}
+		_, params := splitEntry(entry)
+		remaining, hasR := params["r"]
+		reset, hasT := params["t"]
 		resetIn := time.Duration(reset) * time.Second
-		if remaining >= 0 && remaining < need && resetIn > quotaMinReset {
+		if hasR && hasT && remaining < need && resetIn > quotaMinReset {
 			wait = max(wait, resetIn)
 		}
 	}
@@ -200,25 +232,31 @@ func parseRateLimitWait(header string, need int) time.Duration {
 // parseRateLimitPace reads a RateLimit header and returns how long until
 // every short-reset bucket (reset within quotaMinReset) holds need requests
 // again, or 0. Each bucket's refill time per request comes from the matching
-// RateLimit-Policy entry (w/q), or defaultRefill if there is none. The t of a
-// short bucket is not used: Hardcover reports t=0 for it while it refills.
+// RateLimit-Policy entry (w/q), or defaultRefill if there is none. A short
+// bucket's t only caps the wait: Hardcover reports t=0 for the per-minute
+// bucket while it refills. Entries without both r and t are ignored.
 func parseRateLimitPace(header, policy string, need int) time.Duration {
 	refill := parseRefill(policy)
 	var wait time.Duration
 	for entry := range strings.SplitSeq(header, ",") {
 		name, params := splitEntry(entry)
-		remaining, ok := params["r"]
-		if !ok || remaining >= need {
+		remaining, hasR := params["r"]
+		reset, hasT := params["t"]
+		resetIn := time.Duration(reset) * time.Second
+		// Skip full buckets, buckets of unknown kind (no t), and long buckets,
+		// which parseRateLimitWait handles.
+		if !hasR || !hasT || remaining >= need || resetIn > quotaMinReset {
 			continue
-		}
-		if reset, ok := params["t"]; ok && time.Duration(reset)*time.Second > quotaMinReset {
-			continue // a long bucket: parseRateLimitWait handles it.
 		}
 		per, ok := refill[name]
 		if !ok {
 			per = defaultRefill
 		}
-		wait = max(wait, time.Duration(need-remaining)*per)
+		refilled := time.Duration(need-remaining) * per
+		if resetIn > 0 {
+			refilled = min(refilled, resetIn) // the bucket is full again at its reset.
+		}
+		wait = max(wait, refilled)
 	}
 	return wait
 }

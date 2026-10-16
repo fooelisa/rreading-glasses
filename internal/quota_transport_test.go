@@ -202,6 +202,8 @@ func TestParseRateLimitPace(t *testing.T) {
 		{"no policy uses the default refill", `"Free";r=2;t=0`, "", 5, 3 * time.Second},
 		{"daily bucket is left to parseRateLimitWait", `"Free (JWT)";r=5;t=0, "daily";r=0;t=900`, policy, 5, 0},
 		{"bucket without r is ignored", `"Free (JWT)";t=0`, policy, 5, 0},
+		{"bucket without t is ignored", `"daily";r=0`, policy, 5, 0},
+		{"wait is capped at the bucket's reset", `"Free";r=0;t=2`, "", 5, 2 * time.Second},
 		{"garbage is ignored", `nonsense;;r=x;t=y`, `junk;q=0;w=x`, 5, 0},
 	}
 	for _, tt := range tests {
@@ -248,7 +250,9 @@ func TestQuotaTransportWaitsForMinuteBucket(t *testing.T) {
 
 func TestQuotaTransportMinuteWaitHonoursContext(t *testing.T) {
 	// Arrange
+	calls := 0
 	upstream := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
 		return rateLimitResponse(http.StatusOK, `"Free (JWT)";r=0;t=0`), nil
 	})
 	qt := &QuotaTransport{RoundTripper: upstream, Reserve: 5}
@@ -262,4 +266,81 @@ func TestQuotaTransportMinuteWaitHonoursContext(t *testing.T) {
 
 	// Assert
 	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, calls, "a cancelled request must not reach Hardcover")
+}
+
+func TestQuotaTransportRechecksDailyBlockAfterWait(t *testing.T) {
+	// Arrange: the per-minute bucket is empty after the first call.
+	now := time.Date(2026, 10, 16, 19, 0, 0, 0, time.UTC)
+	calls := 0
+	upstream := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return rateLimitResponse(http.StatusOK, `"Free (JWT)";r=0;t=0`), nil
+	})
+	var qt *QuotaTransport
+	qt = &QuotaTransport{
+		RoundTripper: upstream,
+		Reserve:      5,
+		now:          func() time.Time { return now },
+		sleep: func(ctx context.Context, d time.Duration) error {
+			// Another request's answer empties the daily bucket meanwhile.
+			qt.observe(ctx, now, `"daily";r=0;t=3600`)
+			now = now.Add(d)
+			return nil
+		},
+	}
+	_, err := qt.RoundTrip(newHardcoverRequest(t))
+	require.NoError(t, err)
+
+	// Act
+	resp, err := qt.RoundTrip(newHardcoverRequest(t))
+
+	// Assert
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	assert.Equal(t, 1, calls, "a request blocked during its wait must not reach Hardcover")
+}
+
+func TestQuotaTransportConcurrentWaitersAreSpaced(t *testing.T) {
+	// Arrange: every answer reports the per-minute bucket empty, so each
+	// request must wait a full refill after the previous answer.
+	var clockMu sync.Mutex
+	now := time.Date(2026, 10, 16, 19, 0, 0, 0, time.UTC)
+	clock := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return now }
+	var sent []time.Time
+	upstream := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		sent = append(sent, clock()) // only one request is in flight at a time
+		resp := rateLimitResponse(http.StatusOK, `"Free (JWT)";r=0;t=0`)
+		resp.Header.Set("RateLimit-Policy", `"Free (JWT)";q=60;w=60;burst=5`)
+		return resp, nil
+	})
+	qt := &QuotaTransport{
+		RoundTripper: upstream,
+		Reserve:      5,
+		now:          clock,
+		sleep: func(_ context.Context, d time.Duration) error {
+			clockMu.Lock()
+			now = now.Add(d)
+			clockMu.Unlock()
+			return nil
+		},
+	}
+
+	// Act
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			resp, err := qt.RoundTrip(newHardcoverRequest(t))
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		})
+	}
+	wg.Wait()
+
+	// Assert
+	require.Len(t, sent, 5)
+	for i := 1; i < len(sent); i++ {
+		assert.GreaterOrEqual(t, sent[i].Sub(sent[i-1]), 5*time.Second, "request %d sent too soon", i)
+	}
 }
