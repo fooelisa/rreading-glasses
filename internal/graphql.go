@@ -43,9 +43,9 @@ import (
 // by HardcoverBatchInterval.
 const HardcoverMaxBatchSize = 5
 
-// HardcoverBatchInterval is how often one batch is sent to Hardcover. It is
-// the ONLY thing pacing Hardcover traffic: the batch loop sends one request per
-// tick, and nothing else throttles the rghc client. (throttledTransport in
+// HardcoverBatchInterval is how often one batch is sent to Hardcover. The
+// batch loop sends one request per tick; QuotaTransport (below) is the only
+// other throttle on the rghc client. (throttledTransport in
 // NewUpstream is used by the Goodreads binary only.)
 //
 // Upstream ships time.Second, i.e. ~60 requests/min -- exactly Hardcover's
@@ -71,6 +71,12 @@ const HardcoverMaxBatchSize = 5
 // ceiling, and 5 s matches it exactly. The 429s left at 5 s come from the
 // separate DAILY limit (5,000 fields on the free tier), which a full Readarr
 // refresh exceeds; QuotaTransport stops sending once that bucket is empty.
+//
+// 5 s still drew ~380 429s a day (2026-10-14..15), all before the daily bucket
+// was empty. The per-minute bucket holds 5 and refills 1/s, so a full batch
+// every 5 s leaves no room for jitter. QuotaTransport now also holds each
+// request until that bucket can take a full batch, so this interval is a
+// floor, not the only pacer.
 const HardcoverBatchInterval = 5 * time.Second
 
 // batchedgqlclient accumulates queries and executes them in batch in order to
