@@ -471,7 +471,17 @@ func TestMergedWorks(t *testing.T) {
 	getter.EXPECT().GetWork(gomock.Any(), mergedID, nil).Return(workBytes, authorID, nil)
 
 	getter.EXPECT().GetAuthor(gomock.Any(), authorID).Return(authorBytes, nil)
-	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(nil)
+	// denormalizeWorks starts an author refresh in the background, which
+	// calls GetAuthorBooks. Signal when it does, so the test can wait for
+	// it instead of ending first and having gomock report a missing call.
+	// Return an empty iterator, not nil: ranging over nil panics, and the
+	// refresh's recover() would swallow it without finishing the refresh.
+	refreshed := make(chan struct{})
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).DoAndReturn(
+		func(context.Context, int64) iter.Seq[int64] {
+			close(refreshed)
+			return func(func(int64) bool) {}
+		})
 
 	err = ctrl.denormalizeWorks(ctx, authorID, workID, mergedID)
 	require.NoError(t, err)
@@ -484,6 +494,12 @@ func TestMergedWorks(t *testing.T) {
 	require.NoError(t, json.Unmarshal(authorBytes, &author))
 
 	assert.Len(t, author.Works, 1)
+
+	select {
+	case <-refreshed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("author refresh never called GetAuthorBooks")
+	}
 }
 
 func TestFuzz(t *testing.T) {
