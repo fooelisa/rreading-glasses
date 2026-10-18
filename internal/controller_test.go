@@ -498,20 +498,30 @@ func TestDenormWaitingSettlesToZero(t *testing.T) {
 	// value once the buffer drains and waitForDenorm never returns.
 	t.Parallel()
 
-	ctrl, err := NewController(newMemoryCache(), NewMockgetter(gomock.NewController(t)), nil, nil)
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
 	require.NoError(t, err)
+
+	// Each work edge calls GetWork once. Failing it keeps the work per edge
+	// to a minimum, and the signal tells the test the edge has been taken
+	// off the buffer, so the gauge check below cannot pass on a stale 0
+	// left by the previous edge.
+	processing := make(chan struct{})
+	getter.EXPECT().GetWork(gomock.Any(), int64(1), gomock.Any()).DoAndReturn(
+		func(context.Context, int64, editionsCallback) ([]byte, int64, error) {
+			processing <- struct{}{}
+			return nil, 0, errNotFound
+		}).AnyTimes()
 
 	go ctrl.Run(t.Context())
 
-	// Edges for an unknown author are processed with no work at all, which
-	// gives the consumer the best chance to read the buffer before the
-	// hand-off is accounted for.
 	for i := range 200 {
-		ctrl.denormC <- edge{kind: authorEdge, parentID: 4340042, childIDs: newSet(int64(i))}
+		ctrl.denormC <- edge{kind: workEdge, parentID: 1, childIDs: newSet(int64(i))}
+		<-processing
 
 		require.Eventually(t, func() bool {
 			return ctrl.metrics.denormWaitingGet() == 0
-		}, time.Second, time.Millisecond, "denormWaiting stuck after edge %d", i)
+		}, time.Second, 10*time.Millisecond, "denormWaiting stuck after edge %d", i)
 	}
 }
 

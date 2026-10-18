@@ -801,6 +801,10 @@ func (c *Controller) Run(ctx context.Context) {
 	// hand-off, so the len() read at the end of each iteration could still
 	// count the edge just processed, and denormWaiting stuck at a non-zero
 	// value once the buffer drained.
+	//
+	// Nothing closes denormC today (Shutdown is a stub). If that changes,
+	// pop() blocks forever and Run never returns, so pop() needs a way to
+	// report that the buffer is closed and empty.
 	denormBuf := &edgebuf{}
 	go func() {
 		for e := range c.denormC {
