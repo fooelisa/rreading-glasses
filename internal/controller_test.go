@@ -492,6 +492,39 @@ func TestFuzz(t *testing.T) {
 	assert.Greater(t, fuzzed, _authorTTL)
 }
 
+func TestDenormWaitingSettlesToZero(t *testing.T) {
+	// The denormWaiting gauge is read after each edge is processed. It must
+	// not count the edge that was just processed, or it sticks at a non-zero
+	// value once the buffer drains and waitForDenorm never returns.
+	t.Parallel()
+
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+
+	// Each work edge calls GetWork once. Failing it keeps the work per edge
+	// to a minimum, and the signal tells the test the edge has been taken
+	// off the buffer, so the gauge check below cannot pass on a stale 0
+	// left by the previous edge.
+	processing := make(chan struct{})
+	getter.EXPECT().GetWork(gomock.Any(), int64(1), gomock.Any()).DoAndReturn(
+		func(context.Context, int64, editionsCallback) ([]byte, int64, error) {
+			processing <- struct{}{}
+			return nil, 0, errNotFound
+		}).AnyTimes()
+
+	go ctrl.Run(t.Context())
+
+	for i := range 200 {
+		ctrl.denormC <- edge{kind: workEdge, parentID: 1, childIDs: newSet(int64(i))}
+		<-processing
+
+		require.Eventually(t, func() bool {
+			return ctrl.metrics.denormWaitingGet() == 0
+		}, time.Second, 10*time.Millisecond, "denormWaiting stuck after edge %d", i)
+	}
+}
+
 func waitForDenorm(ctrl *Controller) {
 	for ctrl.metrics.refreshWaitingGet() != 0 {
 		time.Sleep(100 * time.Millisecond)
