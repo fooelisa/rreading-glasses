@@ -796,9 +796,19 @@ func (c *Controller) Run(ctx context.Context) {
 		}
 	}()
 
+	// Move denormalization edges into the buffer, and pop them below rather
+	// than receiving them through accumulate. accumulate pops only after the
+	// hand-off, so the len() read at the end of each iteration could still
+	// count the edge just processed, and denormWaiting stuck at a non-zero
+	// value once the buffer drained.
 	denormBuf := &edgebuf{}
-	denorms := accumulate(c.denormC, denormBuf)
-	for edge := range denorms {
+	go func() {
+		for e := range c.denormC {
+			denormBuf.push(e)
+		}
+	}()
+	for {
+		edge := denormBuf.pop()
 		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 		ctx = context.WithValue(ctx, middleware.RequestIDKey, fmt.Sprintf("denorm-%d-%d", edge.kind, edge.parentID))
 

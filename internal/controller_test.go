@@ -492,6 +492,29 @@ func TestFuzz(t *testing.T) {
 	assert.Greater(t, fuzzed, _authorTTL)
 }
 
+func TestDenormWaitingSettlesToZero(t *testing.T) {
+	// The denormWaiting gauge is read after each edge is processed. It must
+	// not count the edge that was just processed, or it sticks at a non-zero
+	// value once the buffer drains and waitForDenorm never returns.
+	t.Parallel()
+
+	ctrl, err := NewController(newMemoryCache(), NewMockgetter(gomock.NewController(t)), nil, nil)
+	require.NoError(t, err)
+
+	go ctrl.Run(t.Context())
+
+	// Edges for an unknown author are processed with no work at all, which
+	// gives the consumer the best chance to read the buffer before the
+	// hand-off is accounted for.
+	for i := range 200 {
+		ctrl.denormC <- edge{kind: authorEdge, parentID: 4340042, childIDs: newSet(int64(i))}
+
+		require.Eventually(t, func() bool {
+			return ctrl.metrics.denormWaitingGet() == 0
+		}, time.Second, time.Millisecond, "denormWaiting stuck after edge %d", i)
+	}
+}
+
 func waitForDenorm(ctrl *Controller) {
 	for ctrl.metrics.refreshWaitingGet() != 0 {
 		time.Sleep(100 * time.Millisecond)
