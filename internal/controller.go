@@ -710,6 +710,12 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 	defer func() {
 		if r := recover(); r != nil {
 			Log(ctx).Error("panic", "details", r)
+			// Finish the refresh anyway: decrement refreshWaiting and un-persist
+			// the author. A panic here is most likely deterministic for this
+			// author, so retrying it on every restart would only panic again.
+			// The author refreshes again through the normal path when its
+			// cache entry expires.
+			c.denormC <- edge{kind: refreshDone, parentID: authorID}
 		}
 	}()
 
