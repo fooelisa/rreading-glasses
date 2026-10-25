@@ -555,3 +555,35 @@ func waitForDenorm(ctrl *Controller) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+func TestRefreshAuthorPanicStillFinishes(t *testing.T) {
+	// A panic inside refreshAuthor is recovered so the process survives. The
+	// recover must still finish the refresh: otherwise refreshWaiting stays
+	// above 0 for good and waitForDenorm never returns.
+	t.Parallel()
+
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+
+	// Ranging over a nil iterator panics inside refreshAuthor.
+	authorID := int64(100)
+	called := make(chan struct{})
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).DoAndReturn(
+		func(context.Context, int64) iter.Seq[int64] {
+			close(called)
+			return nil
+		})
+
+	go ctrl.Run(t.Context())
+	ctrl.refreshC <- refreshAuthor{id: authorID}
+
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh never called GetAuthorBooks")
+	}
+	require.Eventually(t, func() bool {
+		return ctrl.metrics.refreshWaitingGet() == 0
+	}, 2*time.Second, 10*time.Millisecond, "refreshWaiting stuck after a panic")
+}
